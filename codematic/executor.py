@@ -38,6 +38,7 @@ class Executor:
     FINISHED_TEST_CASE = 5
     CLEANING_UP = 6
     FINISHED = 7
+    DOCKER_IMAGE_FAILED = 8
 
     """Test case statuses"""
     TEST_CASE_PASSED = 0
@@ -98,14 +99,48 @@ class Executor:
 
             print('Loading Docker client')
             docker_client = docker.from_env()
+            docker_api_client = docker.APIClient()
             dockerfile = open(dockerfile_path, 'w')
             dockerfile.write(s)
             dockerfile.close()
 
             socketio.emit('status', json.dumps({ 'type': self.BUILDING_DOCKER_IMAGE, 'message': 'Building Docker image', 'data': {} }))
             print('Building Docker image')
-            docker_image, _ = docker_client.images.build(
-                rm=True, path=build_dir, tag='test1')
+
+            # Form a unique image name
+            image_name = 'codematic-' + unique_id
+
+            # Build the Docker image using the low-level APIClient as
+            # it can return raw build output messages
+            try:
+                err_msg = ''
+                for line in (docker_api_client.build(
+                    rm=True, path=build_dir, tag=image_name,
+                    encoding='utf-8', decode=True)):
+
+                    # Build generator output is a dict
+                    # Look for the 'stream' key as these contain the build messages
+                    if 'stream' in line:
+                        line = line['stream']
+                        print(line, end='')
+                        # The build messages include the Docker messages which should be ignored
+                        if not line.startswith('Step ') and not line.startswith(' ---> ') and not line.strip() == '':
+                            err_msg += line
+                print(err_msg)
+            except docker.errors.APIError as e:
+                print('Failed to build Docker image (server error).')
+                raise e
+            
+            # If the Docker image build was successful, then the image will
+            # be successfully retrieved
+            try:
+                docker_image = docker_client.images.get(image_name)
+            except docker.errors.ImageNotFound as e:
+                # If not found, then there was an error in the build
+                socketio.emit('status', json.dumps({ 'type': self.DOCKER_IMAGE_FAILED, 'message': err_msg }))
+                print('Failed to build Docker image.')
+                raise e
+
             print('Docker image built successfully')
             socketio.emit('status', json.dumps({ 'type': self.DOCKER_IMAGE_BUILT, 'message': 'Docker image built successfully', 'data': {} }))
 

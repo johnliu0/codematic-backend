@@ -3,5 +3,6 @@ Flask==2.0.1
 Flask-Cors==3.0.10
 flask-mongoengine==1.0.0
 Flask-RESTful==0.3.9
+Flask-SocketIO==5.1.1
 python-dotenv==0.19.0
 python-socketio==5.4.0
