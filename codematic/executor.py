@@ -4,6 +4,7 @@ import re
 import uuid
 import asyncio
 import shutil
+from threading import Thread
 from pathlib import Path
 from typing import List
 
@@ -108,7 +109,7 @@ class Executor:
             print('Building Docker image')
 
             # Form a unique image name
-            image_name = 'codematic-' + unique_id
+            image_name = f'codematic-{unique_id}'
 
             # Build the Docker image using the low-level APIClient as
             # it can return raw build output messages
@@ -144,75 +145,81 @@ class Executor:
             print('Docker image built successfully')
             socketio.emit('status', json.dumps({ 'type': self.DOCKER_IMAGE_BUILT, 'message': 'Docker image built successfully', 'data': {} }))
 
-            extra_args = f'--memory="{self.CONTAINER_MEMORY_LIMIT}M" --cpus={self.CONTAINER_CPU_LIMIT}'
-            # process = await asyncio.create_subprocess_shell(
-            #    f'docker run -i --rm --name test_container {extra_args} {docker_image.id}',
-            #    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
-
             print('Starting Docker container')
             socketio.emit('status', json.dumps({ 'type': self.STARTING_DOCKER_CONTAINER, 'message': 'Starting Docker container', 'data': {} }))
             container = docker_client.containers.run(docker_image.id,
                 remove=True, # --rm, removes the container after it finishes running
                 tty=True, # -t, TTY
                 stdin_open=True, # -i, interactive
-                name='test_container', # --name, specifies the name of the container
+                name=f'codematic-{unique_id}', # --name, specifies the name of the container
                 detach=True, # -d, place the container into the background after it is created
                 mem_limit=f'{self.CONTAINER_MEMORY_LIMIT}M' # --mem-limit, maximum amount of memory that the container can use
             )
 
+            api_client = docker.APIClient(timeout=10)
+
             print('Docker container started')
             socketio.emit('status', json.dumps({ 'type': self.DOCKER_CONTAINER_STARTED, 'message': 'Docker container started', 'data': {} }))
 
+            def run_test_case(idx, entry_point, actual_outputs):
+                exit_code, container_output = container.exec_run(f'sh -c "./{entry_point} < test_case_{idx}.in"')
+                container_output = container_output.decode('utf-8')
+                actual_outputs[idx] = container_output
             
+            actual_outputs = [''] * len(test_case_outputs)
+
             for idx, expected_output in enumerate(test_case_outputs):
                 print(f'Running test case {idx}')
                 socketio.emit('status', json.dumps({ 'type': self.RUNNING_TEST_CASE, 'message': f'Running test case {idx}', 'data': { 'testCase': idx } }))
-                exit_code, container_output = container.exec_run(f'sh -c "./{entry_point} < test_case_{idx}.in"')
-                container_output = container_output.decode('utf-8')
-                status = self.TEST_CASE_PASSED
-                if container_output != expected_output:
+
+                # Start the test case on a new thread
+                thread = Thread(target=run_test_case, args=(idx, entry_point, actual_outputs))
+                thread.start()
+                thread.join(timeout=5.0)
+                
+                # Check if the test case times out
+                timed_out = False
+                if thread.is_alive():
+                    timed_out = True
+                
+                # Get the output of the container and then determine the status
+                container_output = actual_outputs[idx]
+                if timed_out:
+                    status = self.TEST_CASE_TIMED_OUT
+                elif container_output != expected_output:
                     status = self.TEST_CASE_FAILED
+                else:
+                    status = self.TEST_CASE_PASSED
                 print(f'Finished test case {idx}, Status: {status}')
-                #print(exit_code)
-                #print(container_output)
                 message = f'Test case {idx} ' + ('passed' if status == self.TEST_CASE_PASSED else 'failed')
                 socketio.emit('status', json.dumps({ 'type': self.FINISHED_TEST_CASE, 'message': message, 'data': { 'testCase': idx, 'status': status } }))
 
             print('Cleaning up')
             socketio.emit('status', json.dumps({ 'type': self.CLEANING_UP, 'message': 'Cleaning up', 'data': {} }))
 
-            container.stop()
+            container.kill()
             docker_client.images.remove(docker_image.id, force=True)
 
             print('Finished')
             socketio.emit('status', json.dumps({ 'type': self.FINISHED, 'message': 'Finished', 'data': {} }))
 
-
-
-
-            #completed_proc = subprocess.run(
-             #   f'docker run -i --rm --name test_container {extra_args} {docker_image.id} < {test_case_path}',
-             #   shell=True, capture_output=True)
-
-            #print(completed_proc)
-
-            # print('Waiting for Docker container to finish')
-            # prog_out, prog_err = await asyncio.wait_for(process.communicate(), timeout=self.TEST_CASE_TIME_LIMIT)
-            # print('# PROG_OUT')
-            #print(completed_proc.stdout)
-            # print('# PROG_ERR')
-            #print(completed_proc.stderr)
-
         except Exception as e:
-            #shutil.rmtree(build_dir, ignore_errors=True)
+            try:
+                shutil.rmtree(build_dir, ignore_errors=True)
+                container.kill()
+                docker_client.images.remove(docker_image.id, force=True)
+            except:
+                pass
             print(f'Failed to build and run submission.')
             print(e)
             raise e
         finally:
-            pass
-            # Clean up build directory
-            #shutil.rmtree(build_dir, ignore_errors=True)
-
+            try:
+                shutil.rmtree(build_dir, ignore_errors=True)
+                container.kill()
+                docker_client.images.remove(docker_image.id, force=True)
+            except:
+                pass
 
 
 
